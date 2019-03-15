@@ -66,6 +66,7 @@ def parameters():
 def run(title, base_batch_size, base_labeled_batch_size, base_lr, data_seed, **kwargs):
     LOG.info('run title: %s', title)
     ngpu = torch.cuda.device_count()
+    ngpu = 10
     adapted_args = {
         'batch_size': base_batch_size * ngpu,
         'labeled_batch_size': base_labeled_batch_size * ngpu,

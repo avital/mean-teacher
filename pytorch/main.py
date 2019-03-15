@@ -212,79 +212,104 @@ def train(train_loader, model, ema_model, optimizer, epoch, log):
     ema_model.train()
 
     end = time.time()
-    for i, ((input, ema_input), target) in enumerate(train_loader):
-        # measure data loading time
-        meters.update('data_time', time.time() - end)
+    for i, ((big_input, big_ema_input), big_target) in enumerate(train_loader):
+        def parts(x):
+            """Split a "big batch" into 4 parts, then return parts 0,2 and parts 1,3.
+
+            We do this so that each small batch has half labeled, half unlabeled examples.
+            This isn't strictly necessary but they assert for that below and it sounds
+            reasonable.
+            """
+            chunks = torch.chunk(x, 4)
+            return torch.cat((chunks[0], chunks[2]), 0), torch.cat((chunks[1], chunks[3]), 0)
+        
+        input_chunks, ema_input_chunks, target_chunks = (
+            parts(big_input),
+            parts(big_ema_input),
+            parts(big_target),
+        )
 
         adjust_learning_rate(optimizer, epoch, i, len(train_loader))
         meters.update('lr', optimizer.param_groups[0]['lr'])
 
-        input_var = torch.autograd.Variable(input)
-        ema_input_var = torch.autograd.Variable(ema_input, volatile=True)
-        target_var = torch.autograd.Variable(target.cuda(async=True))
-
-        minibatch_size = len(target_var)
-        labeled_minibatch_size = target_var.data.ne(NO_LABEL).sum()
-        assert labeled_minibatch_size > 0
-        meters.update('labeled_minibatch_size', labeled_minibatch_size)
-
-        ema_model_out = ema_model(ema_input_var)
-        model_out = model(input_var)
-
-        if isinstance(model_out, Variable):
-            assert args.logit_distance_cost < 0
-            logit1 = model_out
-            ema_logit = ema_model_out
-        else:
-            assert len(model_out) == 2
-            assert len(ema_model_out) == 2
-            logit1, logit2 = model_out
-            ema_logit, _ = ema_model_out
-
-        ema_logit = Variable(ema_logit.detach().data, requires_grad=False)
-
-        if args.logit_distance_cost >= 0:
-            class_logit, cons_logit = logit1, logit2
-            res_loss = args.logit_distance_cost * residual_logit_criterion(class_logit, cons_logit) / minibatch_size
-            meters.update('res_loss', res_loss.data[0])
-        else:
-            class_logit, cons_logit = logit1, logit1
-            res_loss = 0
-
-        class_loss = class_criterion(class_logit, target_var) / minibatch_size
-        meters.update('class_loss', class_loss.data[0])
-
-        ema_class_loss = class_criterion(ema_logit, target_var) / minibatch_size
-        meters.update('ema_class_loss', ema_class_loss.data[0])
-
-        if args.consistency:
-            consistency_weight = get_current_consistency_weight(epoch)
-            meters.update('cons_weight', consistency_weight)
-            consistency_loss = consistency_weight * consistency_criterion(cons_logit, ema_logit) / minibatch_size
-            meters.update('cons_loss', consistency_loss.data[0])
-        else:
-            consistency_loss = 0
-            meters.update('cons_loss', 0)
-
-        loss = class_loss + consistency_loss + res_loss
-        assert not (np.isnan(loss.data[0]) or loss.data[0] > 1e5), 'Loss explosion: {}'.format(loss.data[0])
-        meters.update('loss', loss.data[0])
-
-        prec1, prec5 = accuracy(class_logit.data, target_var.data, topk=(1, 5))
-        meters.update('top1', prec1[0], labeled_minibatch_size)
-        meters.update('error1', 100. - prec1[0], labeled_minibatch_size)
-        meters.update('top5', prec5[0], labeled_minibatch_size)
-        meters.update('error5', 100. - prec5[0], labeled_minibatch_size)
-
-        ema_prec1, ema_prec5 = accuracy(ema_logit.data, target_var.data, topk=(1, 5))
-        meters.update('ema_top1', ema_prec1[0], labeled_minibatch_size)
-        meters.update('ema_error1', 100. - ema_prec1[0], labeled_minibatch_size)
-        meters.update('ema_top5', ema_prec5[0], labeled_minibatch_size)
-        meters.update('ema_error5', 100. - ema_prec5[0], labeled_minibatch_size)
-
-        # compute gradient and do SGD step
         optimizer.zero_grad()
-        loss.backward()
+
+        # For each sub-batch, accumulate gradients. But only do one optimization step
+        # at the end.
+        #
+        # Note that because of `size_average=False` in the call to cross entropy,
+        # then accumulating (rather than averaging) the gradients is correct.
+        for input, ema_input, target in zip(input_chunks, ema_input_chunks, target_chunks):
+            # measure data loading time
+            meters.update('data_time', time.time() - end)
+
+            input_var = torch.autograd.Variable(input)
+            ema_input_var = torch.autograd.Variable(ema_input, volatile=True)
+            target_var = torch.autograd.Variable(target.cuda(**{'async': True}))
+
+            minibatch_size = len(target_var)
+            labeled_minibatch_size = target_var.data.ne(NO_LABEL).sum()
+            assert labeled_minibatch_size > 0
+            meters.update('labeled_minibatch_size', labeled_minibatch_size)
+
+            ema_model_out = ema_model(ema_input_var)
+            model_out = model(input_var)
+
+            if isinstance(model_out, Variable):
+                assert args.logit_distance_cost < 0
+                logit1 = model_out
+                ema_logit = ema_model_out
+            else:
+                assert len(model_out) == 2
+                assert len(ema_model_out) == 2
+                logit1, logit2 = model_out
+                ema_logit, _ = ema_model_out
+
+            ema_logit = Variable(ema_logit.detach().data, requires_grad=False)
+
+            if args.logit_distance_cost >= 0:
+                class_logit, cons_logit = logit1, logit2
+                res_loss = args.logit_distance_cost * residual_logit_criterion(class_logit, cons_logit) / minibatch_size / 2
+                meters.update('res_loss', res_loss.data[0])
+            else:
+                class_logit, cons_logit = logit1, logit1
+                res_loss = 0
+
+            class_loss = class_criterion(class_logit, target_var) / minibatch_size / 2
+            meters.update('class_loss', class_loss.data[0])
+
+            ema_class_loss = class_criterion(ema_logit, target_var) / minibatch_size / 2
+            meters.update('ema_class_loss', ema_class_loss.data[0])
+
+            if args.consistency:
+                consistency_weight = get_current_consistency_weight(epoch)
+                meters.update('cons_weight', consistency_weight)
+                consistency_loss = consistency_weight * consistency_criterion(cons_logit, ema_logit) / minibatch_size / 2
+                meters.update('cons_loss', consistency_loss.data[0])
+            else:
+                consistency_loss = 0
+                meters.update('cons_loss', 0)
+
+            loss = class_loss + consistency_loss + res_loss
+            assert not (np.isnan(loss.data[0]) or loss.data[0] > 1e10), 'Loss explosion: {}'.format(loss.data[0])
+            meters.update('loss', loss.data[0])
+
+            prec1, prec5 = accuracy(class_logit.data, target_var.data, topk=(1, 5))
+            meters.update('top1', prec1[0], labeled_minibatch_size)
+            meters.update('error1', 100. - prec1[0], labeled_minibatch_size)
+            meters.update('top5', prec5[0], labeled_minibatch_size)
+            meters.update('error5', 100. - prec5[0], labeled_minibatch_size)
+
+            ema_prec1, ema_prec5 = accuracy(ema_logit.data, target_var.data, topk=(1, 5))
+            meters.update('ema_top1', ema_prec1[0], labeled_minibatch_size)
+            meters.update('ema_error1', 100. - ema_prec1[0], labeled_minibatch_size)
+            meters.update('ema_top5', ema_prec5[0], labeled_minibatch_size)
+            meters.update('ema_error5', 100. - ema_prec5[0], labeled_minibatch_size)
+
+            # accumulate sub-batch gradient
+            loss.backward()
+
+        # take an optimization step
         optimizer.step()
         global_step += 1
         update_ema_variables(model, ema_model, args.ema_decay, global_step)
@@ -323,7 +348,7 @@ def validate(eval_loader, model, log, global_step, epoch):
         meters.update('data_time', time.time() - end)
 
         input_var = torch.autograd.Variable(input, volatile=True)
-        target_var = torch.autograd.Variable(target.cuda(async=True), volatile=True)
+        target_var = torch.autograd.Variable(target.cuda(**{'async': True}), volatile=True)
 
         minibatch_size = len(target_var)
         labeled_minibatch_size = target_var.data.ne(NO_LABEL).sum()
@@ -333,7 +358,7 @@ def validate(eval_loader, model, log, global_step, epoch):
         # compute output
         output1, output2 = model(input_var)
         softmax1, softmax2 = F.softmax(output1, dim=1), F.softmax(output2, dim=1)
-        class_loss = class_criterion(output1, target_var) / minibatch_size
+        class_loss = class_criterion(output1, target_var) / minibatch_size / 2
 
         # measure accuracy and record loss
         prec1, prec5 = accuracy(output1.data, target_var.data, topk=(1, 5))
